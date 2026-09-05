@@ -18,8 +18,8 @@ import tempfile
 import time
 import urllib.request
 
-REPO_URL = "https://github.com/JJ-Yvain/deepseek-vision-helper"
-RAW_BASE = "https://raw.githubusercontent.com/JJ-Yvain/deepseek-vision-helper/main"
+REPO_URL = "https://github.com/JJ-Yvain-Skills/deepseek-vision-helper"
+RAW_BASE = "https://raw.githubusercontent.com/JJ-Yvain-Skills/deepseek-vision-helper/main"
 
 # 用户数据：更新时绝不触碰
 KEEP = {"config.json", "vision_hook_state.json", "vision_hook.log", "results"}

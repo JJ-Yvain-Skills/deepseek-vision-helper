@@ -47,7 +47,7 @@ _STATE_FILE = os.path.join(_HERE, "vision_hook_state.json")
 _LOG_MAX_BYTES = 1024 * 1024  # 日志轮转阈值(默认 1MB,可由 config.log_max_bytes 覆盖)
 _UPDATE_URL = os.environ.get(
     "VISION_UPDATE_URL",
-    "https://raw.githubusercontent.com/JJ-Yvain/deepseek-vision-helper/main/VERSION")
+    "https://raw.githubusercontent.com/JJ-Yvain-Skills/deepseek-vision-helper/main/VERSION")
 
 
 def _rotate_log():
@@ -451,8 +451,23 @@ def local_version():
     return None
 
 
+def _ver_tuple(v):
+    """'0.1.12-20260905' → (0, 1, 12)；非数字段截断，仅用于新旧比较。"""
+    parts = []
+    for seg in str(v).split("-")[0].split("."):
+        if seg.isdigit():
+            parts.append(int(seg))
+        else:
+            break
+    return tuple(parts)
+
+
 def check_update(cfg, state):
-    """对比远程 VERSION；返回远程新版本号；无需检查/无更新/失败返回 None。"""
+    """对比远程 VERSION；仅当远程版本更新时返回新版本号，否则 None。
+
+    只判"不等"会被 CDN 缓存滞后坑到（仓库迁移/刚推送时旧地址可能返回更旧的版本，
+    误触发"检测到新版本"并诱发自动更新装回旧代码），故比较新旧而非不等。
+    """
     cur = local_version()
     if not cur:
         return None  # 本地无版本标记 → 跳过（不打扰）
@@ -468,7 +483,9 @@ def check_update(cfg, state):
             latest = resp.read().decode("utf-8").strip()
     except Exception:
         return None  # 网络失败静默
-    return latest if (latest and latest != cur) else None
+    if not latest or latest == cur:
+        return None
+    return latest if _ver_tuple(latest) > _ver_tuple(cur) else None
 
 
 _PLACEHOLDER_RE = None  # 延迟初始化（避免 import 顺序问题）

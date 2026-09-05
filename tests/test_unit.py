@@ -111,6 +111,10 @@ def run_unit():
     rec("6b. check_update 检测新版", latest == "2.0.0")
     open(remote, "w").write("1.2.3")
     rec("6c. 版本一致无更新", vh.check_update({}, {}) is None)
+    open(remote, "w").write("1.2.2")
+    rec("6e. 远端更旧(缓存滞后)不误报新版", vh.check_update({}, {}) is None)
+    open(remote, "w").write("1.3.0-20260905")
+    rec("6f. 带日期后缀的新版可检出", vh.check_update({}, {}) == "1.3.0-20260905")
     rec("6d. 频率控制(刚查过跳过)", vh.check_update({}, {"last_update_check": time.time()}) is None)
 
     # ---------- 7. file_to_data_uri: 双重编码修复 ----------
