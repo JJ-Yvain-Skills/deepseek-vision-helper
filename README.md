@@ -53,45 +53,45 @@
 }
 ```
 
-## 自动路由（默认：agnes 免费打底，mimo 兜底/批量）
+## 自动路由（单后端 agnes + 分批节流 + 定时重试）
 
 | 场景 | 行为 |
 |---|---|
-| 1 ~ 3 张图（`batch_threshold`） | 用 `provider`（默认 agnes / agnes-2.5-flash，免费） |
-| 单张默认后端失败（报错/超时/限流） | 自动降级 `fallback_provider`（默认 mimo）重试该图 |
-| 超过 3 张图 | 整批改用 `batch_provider`（默认 mimo，质量高、避开免费后端限流） |
-| 手动强制 | 环境变量 `VISION_PROVIDER=mimo` 强制只用某 provider |
+| 任意张数 | 统一走 `provider`（默认 agnes / agnes-2.5-flash，免费） |
+| 批量（超过 `batch_chunk_size` 张） | 不换后端，**分批提交**：每批 N 张串行识别，批间暂停 `batch_chunk_pause` 秒（避开免费后端限流） |
+| 单张报错（网络波动/超时/429/5xx/1302/1305） | 按 `retry_delays` 定时退避轮询重试（默认 2s→5s→10s，共 4 次尝试） |
+| 认证/额度类错误（401/402/403） | 不重试（重试无意义），快速失败并在日志标明 |
+| 手动强制 | 环境变量 `VISION_PROVIDER=zhipu` 强制只用某 provider |
+| 可选降级 | 配置 `fallback_provider` 后，provider 失败会降级到它重试该图（默认不配置） |
 
 配置项（`config.json`，改动即时生效）：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `provider` | `agnes` | 常规后端 |
-| `batch_provider` | `mimo` | 批量后端（超过阈值时） |
-| `fallback_provider` | `mimo` | 常规/批量失败后的降级后端 |
-| `batch_threshold` | 3 | 超过此张数视为批量 |
+| `batch_chunk_size` | 3 | 分批大小：每识别 N 张暂停一次 |
+| `batch_chunk_pause` | 2 | 批间暂停秒数 |
+| `retry_delays` | [2, 5, 10] | 单张失败后的定时退避重试间隔（秒），列表长度即重试次数 |
+| `fallback_provider` | （无） | 可选降级后端，配置了才启用 |
 | `max_images` | 4 | 单次最多识别张数（超出部分注入时注明） |
-| `per_image_max_chars` / `total_max_chars` | 800 / 4000 | 单张/总注入长度上限 |
+| `per_image_max_chars` / `total_max_chars` | 2000 / 8000 | 单张/总注入长度上限 |
 | `session_db_path` | 由 artifacts_dir 推导 | 会话 DB 路径（`input_history` 权威信号来源；默认 `~/.zcode/cli/db/db.sqlite`） |
 | `fresh_seconds` | 300 | DB 不可用时的兜底扫描新鲜度窗口（秒） |
 
-批量行为：每张图独立调用、**串行**执行（避免撞免费后端并发限流），结果合并注入
-（`图1: ... 图2: ...`）。批量最坏耗时 ≈ 张数 × 单张耗时（mimo 约 40s/张），
-hook 超时已放宽到 5 分钟。嫌慢可调低 `max_images` 或把 `batch_provider` 设为 `zhipu`。
+批量行为：每张图独立调用、**串行**执行（避免撞免费后端并发限流），每 `batch_chunk_size`
+张后暂停 `batch_chunk_pause` 秒再提交下一批，结果合并注入（`图1: ... 图2: ...`）。
+单张最坏耗时 ≈ (1+重试次数) × 单张超时；嫌慢可调小 `retry_delays` 或 `timeout_seconds`。
 
 Provider 说明：
 
 | provider | 后端 | 说明 |
 |---|---|---|
-| `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | 当前默认、免费 |
+| `agnes` | agnes-2.5-flash（apihub.agnes-ai.com） | 当前唯一在用后端，免费、稳定 |
 | `zhipu` | 免费 GLM-4.6V-Flash | 备选（config.example 示例，本机当前未配置） |
-| `mimo` | 小米 MiMo-V2.5（经 opencode Go 网关） | 质量高但较慢；消耗套餐配额；批量/降级默认 |
-| `mimo-direct` | 小米官方 API（api.xiaomimimo.com） | 备用；需 platform.xiaomimimo.com 的 key |
 
-注意：
-- `mimo-v2.5` 才支持图片，`mimo-v2.5-pro` 不支持。
-- 2026-08-01 实测：opencode Go 网关识图（mimo-v2.5）可用。该网关历史上对多模态
-  图片输入有 HTTP 500 问题（GitHub issue #33942），如再次出现请切换 `zhipu` 或 `mimo-direct`。
+> 2026-09-05 变更：移除 opencode.ai 网关的 `mimo` 后端（该工作区额度耗尽，HTTP 401
+> CreditsError），批量与降级统一改走 agnes + 分批 + 定时重试。如需恢复多后端，
+> 在 `providers` 里加条目并配 `fallback_provider` 即可。
 
 ## 批量识别文件夹（数十张图）
 
@@ -105,10 +105,10 @@ python vision_hook.py --folder "D:/图片目录" --out "D:/图片目录/results.
 python vision_hook.py --files a.png b.png c.png --out results.md
 
 # 强制某 provider / 限量
-python vision_hook.py --folder "D:/图片目录" --provider mimo --max 20 --out results.md
+python vision_hook.py --folder "D:/图片目录" --provider zhipu --max 20 --out results.md
 ```
 
-- 路由与 hook 完全一致：≤3 张走默认 provider（agnes），>3 张走 mimo，失败自动降级（`--provider` 可强制）
+- 路由与 hook 完全一致：统一走默认 provider（agnes），批量分批提交、批间暂停，单张失败定时退避重试（`--provider` 可强制）
 - 支持 png/jpg/jpeg/webp/gif/bmp；串行执行，每张独立调用
 - **在对话里直接说**："识别 D:/xxx 下所有图片，结果存到 results.md"——DeepSeek 会自己调用这个脚本，再读文件帮你汇总，几十张图也不怕
 - `--out` 建议必填：结果落盘后模型按需读取，避免把几十段描述灌进上下文
@@ -142,4 +142,4 @@ echo '{"hook_event_name":"UserPromptSubmit","session_id":"x","transcript_path":"
 ## 安全提醒
 
 - key 只存在本机 `config.json`；不要在聊天中明文发送、不要提交到任何仓库。
-- 若 key 曾在聊天/日志中泄露过，建议到 bigmodel.cn 控制台重置。
+- 若 key 曾在聊天/日志中泄露过，到对应 provider 的控制台重置（本机当前：agnes）。

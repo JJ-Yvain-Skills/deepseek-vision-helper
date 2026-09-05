@@ -21,8 +21,12 @@ ZCode Vision Hook —— 给纯文本模型（DeepSeek 等）装上"眼睛"。
   5. 至少一张识别成功后，把本次识别的附件记入 state（下次不再重复注入）
 
 路由（config.json 可调）：
-  - 1 ~ batch_threshold 张  → provider（默认 agnes / agnes-2.5-flash），失败降级 fallback_provider
-  - 超过 batch_threshold 张 → batch_provider（默认 mimo / 小米 MiMo-V2.5），失败降级 fallback_provider
+  - 所有图片统一走 provider（默认 agnes / agnes-2.5-flash）；批量不再切换后端，
+    改为分批提交：每 batch_chunk_size 张一批、批间暂停 batch_chunk_pause 秒（串行节流，
+    避开免费后端限流）
+  - 单张失败由 call_vision 按 retry_delays 定时退避轮询重试兜底（默认 2s/5s/10s 三次；
+    仅网络/超时/限流类错误重试，认证/额度类错误快速失败）
+  - 可选 fallback_provider：配置了才启用（provider 失败后降级重试该图），默认不配置
   - 环境变量 VISION_PROVIDER=xxx 可强制只用某 provider（调试用）
   - 环境变量 VISION_CONFIG=/path/to/config.json 可指定配置文件（测试用）
 
@@ -70,7 +74,7 @@ def load_config():
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
     # 环境变量覆盖 API key（优先级高于 config.json）：
-    #   VISION_API_KEY_<PROVIDER 大写、连字符转下划线>，如 VISION_API_KEY_ZHIPU / VISION_API_KEY_MIMO_DIRECT
+    #   VISION_API_KEY_<PROVIDER 大写、连字符转下划线>，如 VISION_API_KEY_ZHIPU
     for name, p in cfg.get("providers", {}).items():
         env_key = os.environ.get("VISION_API_KEY_" + name.upper().replace("-", "_"))
         if env_key:
@@ -496,7 +500,12 @@ _SYSTEM_PROMPT = (
 
 
 def call_vision(cfg, data_uri, question, provider):
-    """调用 OpenAI 兼容 /chat/completions，返回识别文本；失败返回 None。"""
+    """调用 OpenAI 兼容 /chat/completions，返回识别文本；失败返回 None。
+
+    兜底重试：网络波动/超时/连接重置/限流(408/429/5xx/1302/1305)按 retry_delays
+    定时退避轮询重试（默认 [2,5,10] 即最多 1+3 次尝试）；认证/额度类错误
+    (401/402/403 等其余 4xx)重试无意义，立即失败。
+    """
     providers = cfg.get("providers", {})
     if provider not in providers:
         log("provider missing in config: %s" % provider)
@@ -522,8 +531,10 @@ def call_vision(cfg, data_uri, question, provider):
     }
     headers[p.get("header", "Authorization")] = p.get("auth_prefix", "") + p["api_key"]
     body = json.dumps(payload).encode("utf-8")
+    delays = cfg.get("retry_delays", [2, 5, 10])
     last_err = "unknown"
-    for attempt in range(2):
+    for attempt in range(1 + len(delays)):
+        retryable = False
         try:
             req = urllib.request.Request(p["base_url"], data=body, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=cfg.get("timeout_seconds", 90)) as resp:
@@ -531,25 +542,36 @@ def call_vision(cfg, data_uri, question, provider):
             return str(data["choices"][0]["message"]["content"]).strip()
         except urllib.error.HTTPError as e:
             last_err = "HTTP %s: %s" % (e.code, e.read(300).decode("utf-8", "replace"))
-            retry = e.code in (429, 500, 502, 503, 504) or "1302" in last_err or "1305" in last_err
-            if not retry:
-                break
-            time.sleep(2)
+            retryable = (e.code in (408, 429, 500, 502, 503, 504)
+                         or "1302" in last_err or "1305" in last_err)
         except Exception as e:
-            last_err = str(e)[:300]
-            if attempt == 0:
-                time.sleep(2)
+            # 网络波动/超时/连接重置等传输层错误：agnes 后端本身稳定，多数重试即可恢复
+            last_err = "%s: %s" % (type(e).__name__, str(e)[:300])
+            retryable = True
+        if not retryable or attempt >= len(delays):
+            break
+        log("vision api retry (%s) in %ds [%d/%d]: %s" % (
+            provider, delays[attempt], attempt + 1, len(delays), last_err))
+        time.sleep(delays[attempt])
     log("vision api failed (%s): %s" % (provider, last_err))
     return None
 
 
 def build_chain(cfg):
-    """按路由规则返回 provider 链（保序去重）。"""
+    """返回 provider 识别链（保序去重）：常规 provider，可选降级 fallback_provider。
+
+    批量不再换后端（统一走本链，节奏由分批节流 + 定时重试控制）；
+    fallback_provider 仅在配置了且与 provider 不同才生效。
+    环境变量 VISION_PROVIDER=xxx 强制只用某 provider（调试用）。
+    """
     forced = os.environ.get("VISION_PROVIDER")
     if forced:
         return [forced]
-    threshold = cfg.get("batch_threshold", 3)
-    return [cfg.get("provider", "agnes"), cfg.get("fallback_provider", "mimo")]
+    chain = [cfg.get("provider", "agnes")]
+    fb = cfg.get("fallback_provider")
+    if fb:
+        chain.append(fb)
+    return list(dict.fromkeys(p for p in chain if p))
 
 
 def main():
@@ -667,16 +689,10 @@ def main():
     budget = float(cfg.get("recognition_time_budget", 240))
     deadline = time.time() + budget
 
-    # 5) 路由：单图用默认 provider；超过阈值整批用 batch_provider
-    threshold = cfg.get("batch_threshold", 3)
-    if len(kept) > threshold:
-        chain = [cfg.get("batch_provider", "mimo"), cfg.get("fallback_provider", "mimo")]
-    else:
-        chain = [cfg.get("provider", "agnes"), cfg.get("fallback_provider", "mimo")]
-    forced = os.environ.get("VISION_PROVIDER")
-    if forced:
-        chain = [forced]
-    chain = list(dict.fromkeys(p for p in chain if p))
+    # 5) 路由：统一走 provider 链（默认仅 agnes）。批量不换后端，改为分批提交：
+    #    每 batch_chunk_size 张一批、批间暂停 batch_chunk_pause 秒（串行节流避开
+    #    免费后端限流）；单张失败由 call_vision 定时退避重试兜底。
+    chain = build_chain(cfg)
     log("routing: %d image(s), chain=%s" % (len(kept), chain))
 
     # 纯识别指令：不把用户问题传给视觉模型（用户问题中的"如何解决/建议"类
@@ -698,9 +714,14 @@ def main():
     multi = len(kept) > 1
     processed = 0      # 已尝试处理的张数（含失败）
     done = 0           # 识别成功的张数
+    chunk_size = max(1, int(cfg.get("batch_chunk_size", 3)))
+    chunk_pause = float(cfg.get("batch_chunk_pause", 2))
     for i, (mime, data_uri) in enumerate(kept, 1):
         if time.time() > deadline:
             break  # 时间预算用完：剩余图不记账，下次"继续"续传
+        if i > 1 and (i - 1) % chunk_size == 0:
+            log("chunk pause: %ds after %d image(s)" % (int(chunk_pause), i - 1))
+            time.sleep(chunk_pause)  # 分批节流：每完成一批歇一下再提交下一批
         q = ("图%d。%s" % (i, recog_q)) if multi else recog_q
         ok = False
         for prov in chain:
@@ -846,7 +867,12 @@ def run_folder_mode(cfg, files, question, out_path, chain, per_cap, plain=False)
     plain=True（单文件、无 --out）时输出纯描述文本，便于模型直接读取（主动调用模式）。
     """
     lines, ok_count = [], 0
+    chunk_size = max(1, int(cfg.get("batch_chunk_size", 3)))
+    chunk_pause = float(cfg.get("batch_chunk_pause", 2))
     for i, path in enumerate(files, 1):
+        if i > 1 and (i - 1) % chunk_size == 0:
+            log("chunk pause: %ds after %d image(s)" % (int(chunk_pause), i - 1))
+            time.sleep(chunk_pause)  # 分批节流：每完成一批歇一下再提交下一批
         name = os.path.basename(path)
         mime = mime_for(path)
         try:
@@ -907,15 +933,11 @@ def main_cli(argv):
     if not files:
         print("未找到图片文件")
         return
-    # 路由与 hook 一致：超过 batch_threshold 张走 batch_provider，失败降级 fallback_provider
-    threshold = cfg.get("batch_threshold", 3)
+    # 路由与 hook 一致：统一走 provider 链（批量不换后端，分批节流见 run_folder_mode）
     if args.provider:
         chain = [args.provider]
-    elif len(files) > threshold:
-        chain = [cfg.get("batch_provider", "mimo"), cfg.get("fallback_provider", "mimo")]
     else:
-        chain = [cfg.get("provider", "agnes"), cfg.get("fallback_provider", "mimo")]
-    chain = list(dict.fromkeys(p for p in chain if p))
+        chain = build_chain(cfg)
     log("folder mode: %d file(s), chain=%s" % (len(files), chain))
     question = args.question or cfg.get("default_question")
     # 单文件且不落盘：输出纯描述文本（模型主动调用模式）

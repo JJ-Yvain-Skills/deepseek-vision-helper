@@ -1,8 +1,8 @@
 {
   "provider": "agnes",
-  "batch_provider": "mimo",
-  "fallback_provider": "mimo",
-  "batch_threshold": 3,
+  "batch_chunk_size": 3,
+  "batch_chunk_pause": 2,
+  "retry_delays": [2, 5, 10],
   "max_images": 4,
   "per_image_max_chars": 2000,
   "total_max_chars": 8000,
@@ -20,13 +20,6 @@
   "state_cleanup_interval_hours": 24,
   "default_question": "请识别这张图片：如果包含文字请完整提取；如果是界面、报错页面或图表，请说明其内容与含义。只输出图片中的事实，不要分析、建议或反问。",
   "providers": {
-    "zhipu": {
-      "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-      "api_key": "YOUR_ZHIPU_API_KEY",
-      "model": "glm-4.6v-flash",
-      "header": "Authorization",
-      "auth_prefix": "Bearer "
-    },
     "agnes": {
       "base_url": "https://apihub.agnes-ai.com/v1/chat/completions",
       "api_key": "YOUR_AGNES_API_KEY",
@@ -34,17 +27,10 @@
       "header": "Authorization",
       "auth_prefix": "Bearer "
     },
-    "mimo": {
-      "base_url": "https://opencode.ai/zen/go/v1/chat/completions",
-      "api_key": "YOUR_MIMO_API_KEY",
-      "model": "mimo-v2.5",
-      "header": "Authorization",
-      "auth_prefix": "Bearer "
-    },
-    "mimo-direct": {
-      "base_url": "https://api.xiaomimimo.com/v1/chat/completions",
-      "api_key": "YOUR_MIMO_DIRECT_API_KEY",
-      "model": "mimo-v2.5",
+    "zhipu": {
+      "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "api_key": "YOUR_ZHIPU_API_KEY",
+      "model": "glm-4.6v-flash",
       "header": "Authorization",
       "auth_prefix": "Bearer "
     }
